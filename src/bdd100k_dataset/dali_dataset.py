@@ -1,5 +1,7 @@
 from pathlib import Path
 from random import shuffle
+import numpy as np
+import xxhash
 
 import nvidia.dali.fn as fn
 from nvidia.dali.pipeline import pipeline_def
@@ -56,14 +58,14 @@ class BDD100kDaliReader:
             self.n -= last_batch_size
             self.sequences = self.sequences[:-last_batch_size]
 
+        if self.train:
+            self.shuffle()
+
     @property
     def num_iterations(self):
         return self.n // self.batch_size
 
     def __iter__(self):
-        if self.train:
-            shuffle(self.sequences)
-
         return (
             self.sequences[i : i + self.batch_size]
             for i in range(0, self.n, self.batch_size)
@@ -72,11 +74,23 @@ class BDD100kDaliReader:
     def get_imagedata_and_metadata_readers(self):
         return ImageDataIterator(self), MetadataIterator(self)
 
+    def shuffle(self):
+        shuffle(self.sequences)
+
 
 class BaseIterator:
-    def __init__(self, ba`se_dataset):
+    def __init__(self, base_dataset):
         self.base_dataset = base_dataset
         self.curr_iterator = self.reset()
+
+    def hash_image_buffer(self, image_buffer_list):
+        return np.asarray(
+            [
+                np.asarray([xxhash.xxh32_intdigest(image_buffer)])
+                for image_buffer in image_buffer_list
+            ],
+            dtype=np.int32,
+        )
 
     def reset(self):
         return iter(self.base_dataset)
@@ -93,7 +107,8 @@ class ImageDataIterator(BaseIterator):
     def __next__(self):
         data = next(self.curr_iterator)
         flattened_image_data = [img_data for d in data for img_data in d["image_data"]]
-        return (flattened_image_data,)
+        image_hashes = self.hash_image_buffer(flattened_image_data)
+        return (flattened_image_data, image_hashes)
 
 
 class MetadataIterator(BaseIterator):
@@ -101,12 +116,17 @@ class MetadataIterator(BaseIterator):
         data = next(self.curr_iterator)
         labels = [d["labels"] for d in data]
         full_names = [
-            f"{video_name}/{name}"
+            [
+                f"{video_name}/{name}"
+                for name, video_name in zip(d["name"], d["videoName"])
+            ]
             for d in data
-            for name, video_name in zip(d["name"], d["videoName"])
         ]
 
-        return {"filenames": full_names, "labels": labels}
+        flattened_image_data = [img_data for d in data for img_data in d["image_data"]]
+        image_hashes = self.hash_image_buffer(flattened_image_data)
+
+        return {"filenames": full_names, "labels": labels, "image_hashes": image_hashes}
 
 
 class BDD100kDaliDataset:
@@ -126,7 +146,7 @@ class BDD100kDaliDataset:
         num_gpus: int = 1,
         num_threads: int = 8,
     ):
-        self.imagedata_reader, self.metadata_reader = BDD100kDaliReader(
+        self.bdd_reader = BDD100kDaliReader(
             bdd100k_root_dir=bdd100k_root_dir,
             numpy_cache_dir=numpy_cache_dir,
             train=train,
@@ -138,7 +158,11 @@ class BDD100kDaliDataset:
             batch_size=batch_size,
             device_id=global_rank,
             num_gpus=num_gpus,
-        ).get_imagedata_and_metadata_readers()
+        )
+
+        self.imagedata_reader, self.metadata_reader = (
+            self.bdd_reader.get_imagedata_and_metadata_readers()
+        )
 
         self.dali_pipeline = self.pipe(
             batch_size=batch_size * window_size,
@@ -146,30 +170,32 @@ class BDD100kDaliDataset:
             device_id=local_rank,
         )
 
-        outputs = ["images"]
+        outputs = ["images", "image_hashes"]
 
         self.pytorch_iterator = BDD100kPytorchIterator(
             self.dali_pipeline,
             output_map=outputs,
             output_types=[
                 DALIRaggedIterator.DENSE_TAG,
+                DALIRaggedIterator.DENSE_TAG,
             ],
             window_size=window_size,
             metadata_reader=self.metadata_reader,
+            bdd_reader=self.bdd_reader,
         )
 
     @pipeline_def
     def pipe(self):
-        jpegs = fn.external_source(
+        jpegs, hashes = fn.external_source(
             source=self.imagedata_reader,
-            num_outputs=1,
+            num_outputs=2,
             cycle="raise",
         )
         images = fn.decoders.image(jpegs, device="mixed")
-        return images
+        return images, hashes
 
     def __iter__(self):
-        return iter(self.pytorch_iterator)
+        return self.pytorch_iterator.__iter__()
 
     def __len__(self):
         return self.reader.num_iterations
@@ -179,6 +205,7 @@ class BDD100kPytorchIterator(DALIRaggedIterator):
     def __init__(self, *args, **kwargs):
         self.window_size = kwargs.pop("window_size")
         self.metadata_reader = kwargs.pop("metadata_reader")
+        self.bdd_reader = kwargs.pop("bdd_reader")
         super().__init__(*args, **kwargs)
 
     def __next__(self):
@@ -186,12 +213,23 @@ class BDD100kPytorchIterator(DALIRaggedIterator):
             data = super().__next__()
             metadata = self.metadata_reader.__next__()
         except StopIteration:
+            if self.bdd_reader.train:
+                self.bdd_reader.shuffle()
             self.metadata_reader = iter(self.metadata_reader)
             raise StopIteration
 
         filenames = metadata["filenames"]
         labels = metadata["labels"]
+        hashes = metadata["image_hashes"]
+
         images = data[0]["images"]
         images = images.unflatten(0, (-1, self.window_size))
+        image_hashes = data[0]["image_hashes"]
 
-        return {"images": images, "filenames": filenames, "labels": labels}
+        return {
+            "images": images,
+            "filenames": filenames,
+            "labels": labels,
+            "dali_hashes": image_hashes,
+            "meta_hashes": hashes,
+        }

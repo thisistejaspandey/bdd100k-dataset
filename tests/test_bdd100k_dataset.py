@@ -1,11 +1,12 @@
 import pytest
 from pathlib import Path
-from bdd100k_dataset.bdd_dataset import (
+from bdd100k_dataset import (
     BDD100kLabel,
     BDD100kVideoReader,
+    BDD100kDaliDataset,
 )
 from icecream import ic
-
+from tqdm import tqdm
 import numpy as np
 
 
@@ -184,7 +185,7 @@ def test_bdd100k_dataset_remove_background():
 
     # Test remove background.
     dataset = BDD100kVideoReader(
-        "/home/tejas/gits/datasets/bdd100k/",
+        "data/bdd100k/",
         window_size=5,
         train=False,
         include_image_data=False,
@@ -192,16 +193,16 @@ def test_bdd100k_dataset_remove_background():
     )
 
     for data in dataset:
-        for label_data in data['labels'].values():
+        for label_data in data["labels"].values():
             for frame_data in label_data.values():
-                assert frame_data['category'] in classes
-    
+                assert frame_data["category"] in classes
+
 
 def test_bdd100k_dataset_clean_trajectories():
     # Test clean trajectories.
     window_size = 5
     dataset = BDD100kVideoReader(
-        "/home/tejas/gits/datasets/bdd100k/",
+        "data/bdd100k/",
         window_size=window_size,
         train=False,
         include_image_data=False,
@@ -210,7 +211,7 @@ def test_bdd100k_dataset_clean_trajectories():
     )
 
     for data in dataset:
-        for label_data in data['labels'].values():
+        for label_data in data["labels"].values():
             assert len(label_data.keys()) == window_size
 
 
@@ -218,7 +219,7 @@ def test_bdd100k_dataset_clean_first():
     # Test clean trajectories.
     window_size = 5
     dataset = BDD100kVideoReader(
-        "/home/tejas/gits/datasets/bdd100k/",
+        "data/bdd100k/",
         window_size=window_size,
         train=False,
         include_image_data=False,
@@ -227,14 +228,34 @@ def test_bdd100k_dataset_clean_first():
     )
 
     for data in dataset:
-        for label_data in data['labels'].values():
+        for label_data in data["labels"].values():
             assert 0 in label_data.keys()
 
 
+def test_bdd100k_dali_reader_shuffle():
+    # Setup the dataset with parameters that enable shuffling
+    dataset = BDD100kDaliDataset(
+        bdd100k_root_dir="data/bdd100k/",
+        train=True,  # Enable training mode to ensure shuffling is active
+        window_size=5,
+        batch_size=8,
+    )
 
+    first_hash = None
+    for idx, data in tqdm(enumerate(dataset)):
+        if idx == 0:
+            assert np.array_equal(
+                data["dali_hashes"].numpy(), data["meta_hashes"]
+            ), "Iterators not in sync!"
+            first_hash = data["meta_hashes"]
 
+        continue
 
+    for data in dataset:
+        assert np.array_equal(
+            data["dali_hashes"].numpy(), data["meta_hashes"]
+        ), "Iterators not in sync!"
+        second_hash = data["meta_hashes"]
+        break
 
-
-            
-
+    assert not np.array_equal(first_hash, second_hash), "Dataset not shuffled!"
