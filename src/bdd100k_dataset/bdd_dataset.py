@@ -70,7 +70,7 @@ class BDD100kLabel:
                 )
 
             image_path = self.image_dir / video_name / image_name
-            label_data["image_data"] = image_path.read_bytes()
+            label_data["image_data"] = np.frombuffer(image_path.read_bytes(), dtype=np.uint8)
 
         return label_data
 

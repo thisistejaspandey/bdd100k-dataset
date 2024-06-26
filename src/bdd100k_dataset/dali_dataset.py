@@ -50,27 +50,63 @@ class BDD100kDaliReader:
         self.batch_size = batch_size
         self.window_size = window_size
 
+        # Drop the last batch if it's smaller than the batch size.
+        last_batch_size = self.n % self.batch_size
+        if last_batch_size:
+            self.n -= last_batch_size
+            self.sequences = self.sequences[:-last_batch_size]
+
+    @property
+    def num_iterations(self):
+        return self.n // self.batch_size
+
     def __iter__(self):
         if self.train:
             shuffle(self.sequences)
 
-        self.i = 0
+        return (
+            self.sequences[i : i + self.batch_size]
+            for i in range(0, self.n, self.batch_size)
+        )
+
+    def get_imagedata_and_metadata_readers(self):
+        return ImageDataIterator(self), MetadataIterator(self)
+
+
+class BaseIterator:
+    def __init__(self, ba`se_dataset):
+        self.base_dataset = base_dataset
+        self.curr_iterator = self.reset()
+
+    def reset(self):
+        return iter(self.base_dataset)
+
+    def __iter__(self):
+        self.curr_iterator = self.reset()
         return self
 
     def __next__(self):
-        if self.i >= self.n - self.batch_size + 1:
-            self.__iter__()
-            raise StopIteration
+        raise NotImplementedError
 
-        batched_sequences = self.sequences[self.i : self.i + self.batch_size]
-        batched_sequences_frame_data = [
-            sequence[i].pop("image_data")
-            for sequence in batched_sequences
-            for i in range(self.window_size)
+
+class ImageDataIterator(BaseIterator):
+    def __next__(self):
+        data = next(self.curr_iterator)
+        flattened_image_data = [img_data for d in data for img_data in d["image_data"]]
+        return (flattened_image_data,)
+
+
+class MetadataIterator(BaseIterator):
+    def __next__(self):
+        data = next(self.curr_iterator)
+        labels = [d["labels"] for d in data]
+        full_names = [
+            f"{video_name}/{name}"
+            for d in data
+            for name, video_name in zip(d["name"], d["videoName"])
         ]
 
-        self.i += self.batch_size
-        return batched_sequences_frame_data
+        return {"filenames": full_names, "labels": labels}
 
 
 class BDD100kDaliDataset:
@@ -90,7 +126,7 @@ class BDD100kDaliDataset:
         num_gpus: int = 1,
         num_threads: int = 8,
     ):
-        self.reader = BDD100kDaliReader(
+        self.imagedata_reader, self.metadata_reader = BDD100kDaliReader(
             bdd100k_root_dir=bdd100k_root_dir,
             numpy_cache_dir=numpy_cache_dir,
             train=train,
@@ -102,7 +138,7 @@ class BDD100kDaliDataset:
             batch_size=batch_size,
             device_id=global_rank,
             num_gpus=num_gpus,
-        )
+        ).get_imagedata_and_metadata_readers()
 
         self.dali_pipeline = self.pipe(
             batch_size=batch_size * window_size,
@@ -114,36 +150,48 @@ class BDD100kDaliDataset:
 
         self.pytorch_iterator = BDD100kPytorchIterator(
             self.dali_pipeline,
-            outputs,
+            output_map=outputs,
             output_types=[
                 DALIRaggedIterator.DENSE_TAG,
-                # DALIRaggedIterator.SPARSE_LIST_TAG,
             ],
+            window_size=window_size,
+            metadata_reader=self.metadata_reader,
         )
 
     @pipeline_def
     def pipe(self):
         jpegs = fn.external_source(
-            source=self.reader,
+            source=self.imagedata_reader,
             num_outputs=1,
             cycle="raise",
         )
-
         images = fn.decoders.image(jpegs, device="mixed")
-
         return images
+
+    def __iter__(self):
+        return iter(self.pytorch_iterator)
+
+    def __len__(self):
+        return self.reader.num_iterations
 
 
 class BDD100kPytorchIterator(DALIRaggedIterator):
     def __init__(self, *args, **kwargs):
+        self.window_size = kwargs.pop("window_size")
+        self.metadata_reader = kwargs.pop("metadata_reader")
         super().__init__(*args, **kwargs)
-        self.window_size = 1
 
     def __next__(self):
-        data = super().__next__()
+        try:
+            data = super().__next__()
+            metadata = self.metadata_reader.__next__()
+        except StopIteration:
+            self.metadata_reader = iter(self.metadata_reader)
+            raise StopIteration
 
+        filenames = metadata["filenames"]
+        labels = metadata["labels"]
         images = data[0]["images"]
-
         images = images.unflatten(0, (-1, self.window_size))
 
-        return images
+        return {"images": images, "filenames": filenames, "labels": labels}
